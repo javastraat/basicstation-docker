@@ -26,6 +26,8 @@
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
+#include <ArduinoOTA.h>
 
 // -------------------- LoRaWAN Region --------------------
 const LoRaWANBand_t Region = EU868;
@@ -41,6 +43,14 @@ uint8_t *appKey = SECRET_APP_KEY;
 uint8_t *nwkKey = SECRET_NWK_KEY;
 
 LoRaWANNode node(&radio, &Region, subBand);
+
+// NVS-backed persistence for the nonce/session buffers RadioLib maintains
+// internally. Without this, every reflash/reboot restarts the DevNonce
+// counter from 0, and TTN's join server rejects any DevNonce it's already
+// seen for this DevEUI (anti-replay) - after enough reflashes with the same
+// DevEUI, that's most low values, causing repeated silent join failures
+// until the in-RAM counter climbs past whatever's already been used.
+Preferences lorawanPrefs;
 
 // -------------------- LoRaWAN behavior --------------------
 uint8_t appPort = 2;
@@ -716,7 +726,7 @@ static void waitWithCountdown(uint32_t totalMs, const String &line1, const Strin
   bool blanked = false;
   static uint32_t buttonWakeUntil = 0;
   while (millis() - waitStart < totalMs) {
-    if (wifiEnabled) server.handleClient();
+    if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
 
     button.update();
     if (button.pressed()) {
@@ -950,6 +960,32 @@ static void wifiSetup()
   server.begin();
   wifiEnabled = true;
   Serial.println("Web server started");
+
+  // ArduinoOTA: lets the Arduino IDE (or arduino-cli) flash over WiFi like a
+  // normal USB upload - the device just shows up as a network port instead
+  // of a serial one, discovered via the same mDNS hostname. Kept alongside
+  // the web-form-based /update (HTTPUpdateServer) rather than replacing it:
+  // that one works from a plain browser (e.g. a phone) with no IDE needed.
+  ArduinoOTA.setHostname("ttn-heltecv4");
+  ArduinoOTA.setPassword(SECRET_WEB_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    Serial.println("ArduinoOTA: update starting");
+    oledStatus("OTA UPDATE", "Starting...");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("ArduinoOTA: %u%%\n", (progress * 100) / total);
+    oledStatus("OTA UPDATE", String((progress * 100) / total) + "%");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("ArduinoOTA: complete, rebooting");
+    oledStatus("OTA UPDATE", "Done, rebooting");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("ArduinoOTA: error %u\n", error);
+    oledStatus("OTA UPDATE", "Error " + String(error));
+  });
+  ArduinoOTA.begin();
+  Serial.println("ArduinoOTA ready");
 }
 
 // Build payload: 2 bytes, big-endian int16 of (temperature_C * 100).
@@ -1062,6 +1098,29 @@ void setup()
 
   RADIOLIB(node.beginOTAA(joinEUI, devEUI, nwkKey, appKey));
 
+  // Restore nonce/session state saved from a previous boot, if any (first
+  // ever boot has neither key set, so this is a no-op then). Both calls can
+  // silently discard the restore (checksum/mode/plan mismatch) and return an
+  // error instead of applying it - checking and logging the result, rather
+  // than assuming success, is the only way to actually know which happened.
+  lorawanPrefs.begin("lorawan", false);
+  if (lorawanPrefs.isKey("nonces")) {
+    uint8_t nonces[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
+    lorawanPrefs.getBytes("nonces", nonces, sizeof(nonces));
+    int16_t nstate = node.setBufferNonces(nonces);
+    Serial.printf("Restore nonces from flash: %d (%s)\n", nstate, lorawanStateDecode(nstate).c_str());
+  } else {
+    Serial.println("No saved nonces in flash (first boot with this firmware)");
+  }
+  if (lorawanPrefs.isKey("session")) {
+    uint8_t session[RADIOLIB_LORAWAN_SESSION_BUF_SIZE];
+    lorawanPrefs.getBytes("session", session, sizeof(session));
+    int16_t sstate = node.setBufferSession(session);
+    Serial.printf("Restore session from flash: %d (%s)\n", sstate, lorawanStateDecode(sstate).c_str());
+  } else {
+    Serial.println("No saved session in flash (first boot with this firmware)");
+  }
+
   oledStatus("STATE: JOIN", "Joining TTN...", "OTAA");
   int16_t state;
   uint8_t attempt = 0;
@@ -1071,6 +1130,12 @@ void setup()
     state = node.activateOTAA();
     RADIOLIB(state);
     Serial.println(lorawanStateDecode(state));
+
+    // Save nonces after every attempt, not just success: the counter
+    // advances as soon as a join-request is actually sent, whether or not
+    // an accept comes back, so a power-cycle mid-retry still needs this.
+    lorawanPrefs.putBytes("nonces", node.getBufferNonces(), RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
+
     if (state != RADIOLIB_LORAWAN_NEW_SESSION && state != RADIOLIB_LORAWAN_SESSION_RESTORED) {
       // blankAfterMs = joinRetryInterval -> never blanks while still trying
       // to join; the screensaver only kicks in once actually connected.
@@ -1083,6 +1148,13 @@ void setup()
   joined = true;
   lastRSSI = radio.getRSSI();
   lastSNR = radio.getSNR();
+
+  // Persist the session too, now that it's actually valid - next boot can
+  // potentially resume it (RADIOLIB_LORAWAN_SESSION_RESTORED) instead of
+  // doing a fresh join at all.
+  lorawanPrefs.putBytes("session", node.getBufferSession(), RADIOLIB_LORAWAN_SESSION_BUF_SIZE);
+  lorawanPrefs.end();
+
   Serial.print("Joined. DevAddr: 0x");
   Serial.println((unsigned long)node.getDevAddr(), HEX);
   oledStatus("STATE: JOIN", "Joined!", "DevAddr set");
@@ -1091,7 +1163,7 @@ void setup()
 
 void loop()
 {
-  if (wifiEnabled) server.handleClient();
+  if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
 
   Serial.println("STATE: SEND");
 
