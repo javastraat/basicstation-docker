@@ -71,9 +71,12 @@ services:
       DEVICE: "/dev/spidev0.0"
       HAS_GPS: 0
 
-      # Default reset pin (GPIO17) fired but chip still reads version 0x00 -
-      # some RAK2287 HAT batches/clones wire reset to GPIO22 instead. Trying
-      # that alongside the device change.
+      # Default reset pin (GPIO17) and GPIO22 both produced flaky/garbage
+      # chip version reads (0x00, 0x05) on this HAT - different RAK2287
+      # batches apparently wire reset to different GPIOs entirely. GPIO25
+      # confirmed correct: a friend's working config for the same HAT uses
+      # it, and it comes up clean on the first try instead of needing
+      # several restart-policy retries or a manual power cycle.
       RESET_GPIO: 25
 
       # GATEWAY_EUI_SOURCE=chip was tried and doesn't work on this image for
