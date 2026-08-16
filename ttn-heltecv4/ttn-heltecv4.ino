@@ -691,15 +691,37 @@ void oledShowBootLogo()
   delay(1800);
 }
 
+// Small status row at the top of every screen (main + menus): a WiFi dot and
+// a LoRaWAN dot, filled = good (STA connected / joined), outline = not
+// (off, AP fallback, or not yet joined). Deliberately just two dots + letters
+// rather than hand-drawn icon bitmaps - simple, always renders correctly,
+// no risk of a cramped/illegible tiny icon at this resolution.
+static void drawTopbar()
+{
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+
+  if (wifiEnabled && !apMode) display.fillCircle(4, 5, 3);
+  else                        display.drawCircle(4, 5, 3);
+  display.drawString(10, 0, "WiFi");
+
+  if (joined) display.fillCircle(64, 5, 3);
+  else        display.drawCircle(64, 5, 3);
+  display.drawString(70, 0, "LoRa");
+
+  display.drawLine(0, 11, 127, 11);
+}
+
 void oledStatus(const String &line1, const String &line2 = "", const String &line3 = "")
 {
   display.displayOn();   // wake it back up in case a previous screen blanked it
   display.clear();
+  drawTopbar();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0,  line1);
-  if (line2.length()) display.drawString(0, 14, line2);
-  if (line3.length()) display.drawString(0, 28, line3);
+  display.drawString(0, 13, line1);
+  if (line2.length()) display.drawString(0, 25, line2);
+  if (line3.length()) display.drawString(0, 37, line3);
 
   // footer
   display.drawString(0, 52, "Uplinks: " + String(uplinkCount));
@@ -713,11 +735,169 @@ void oledStatus(const String &line1, const String &line2 = "", const String &lin
 // totalMs to disable blanking entirely for a given wait (used during join
 // retries - screensaver only kicks in once actually joined).
 //
+// -------------------- PRG button menu --------------------
+// Press = cycle to next item / wake screen. Hold (~800ms-1s) = select item /
+// open menu. Same pattern as old single-button devices (iPod Shuffle,
+// basic thermostats). Menu navigation needs much tighter button polling
+// than the ~1s cadence used elsewhere (waitWithCountdown), so this runs its
+// own tight-poll loop rather than trying to fit through that slower one.
+
+static void oledMenuScreen(const String items[], int count, int selected)
+{
+  display.displayOn();
+  display.clear();
+  drawTopbar();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+  int y = 13;
+  for (int i = 0; i < count && y <= 54; i++) {
+    display.drawString(0, y, (i == selected ? "> " : "  ") + items[i]);
+    y += 10;
+  }
+  display.display();
+}
+
+// Runs one menu level until the user selects an item (returns its index) or
+// it times out with no input (~15s, returns -1 - same as picking "Back").
+static int runMenuLevel(const String items[], int count)
+{
+  int selected = 0;
+  uint32_t lastActivity = millis();
+  const uint32_t MENU_TIMEOUT_MS = 15000;
+
+  oledMenuScreen(items, count, selected);
+
+  while (millis() - lastActivity < MENU_TIMEOUT_MS) {
+    if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
+    button.update();
+
+    if (button.isSingleClick()) {
+      selected = (selected + 1) % count;
+      oledMenuScreen(items, count, selected);
+      lastActivity = millis();
+    }
+    if (button.pressedFor(800)) {
+      return selected;
+    }
+    delay(30);
+  }
+  return -1;
+}
+
+// A read-only screen (e.g. Status/WiFi info) shown until any press or ~10s.
+static void showDetailScreen(const String lines[], int count)
+{
+  display.displayOn();
+  display.clear();
+  drawTopbar();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+  int y = 13;
+  for (int i = 0; i < count && y <= 54; i++) {
+    if (lines[i].length()) display.drawString(0, y, lines[i]);
+    y += 10;
+  }
+  display.display();
+
+  uint32_t start = millis();
+  while (millis() - start < 10000) {
+    if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
+    button.update();
+    if (button.isSingleClick() || button.pressedFor(500)) break;
+    delay(30);
+  }
+}
+
+static void showStatusScreen()
+{
+  String lines[] = {
+    "DevAddr: " + (joined ? String((unsigned long)node.getDevAddr(), HEX) : String("-")),
+    "Heap: " + String(ESP.getFreeHeap() / 1024) + "KB",
+    "Up: " + formatUptime(millis() / 1000),
+    "Sent: " + String(uplinkCount)
+  };
+  showDetailScreen(lines, 4);
+}
+
+static void showWifiInfoScreen()
+{
+  String lines[] = {
+    apMode ? ("AP: " + String(SECRET_AP_SSID)) : ("SSID: " + WiFi.SSID()),
+    "IP: " + String(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()),
+    apMode ? "" : ("RSSI: " + String(WiFi.RSSI()) + "dBm")
+  };
+  showDetailScreen(lines, 3);
+}
+
+static void wifiTeardown()
+{
+  Serial.println("WiFi manually disabled from menu");
+  server.stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiEnabled = false;
+}
+
+static uint32_t INTERVAL_PRESETS[] = { 60000, 120000, 300000, 600000 };
+static const int INTERVAL_PRESET_COUNT = 4;
+
+static void runSettingsMenu()
+{
+  while (true) {
+    String items[] = {
+      "WiFi: " + String(wifiEnabled ? "ON" : "OFF"),
+      "Interval: " + String(appTxDutyCycle / 1000) + "s",
+      "Clear LoRa state",
+      "< Back"
+    };
+    int choice = runMenuLevel(items, 4);
+
+    if (choice == 0) {
+      if (wifiEnabled) wifiTeardown();
+      else wifiSetup();
+    } else if (choice == 1) {
+      bool advanced = false;
+      for (int i = 0; i < INTERVAL_PRESET_COUNT; i++) {
+        if (INTERVAL_PRESETS[i] == appTxDutyCycle) {
+          appTxDutyCycle = INTERVAL_PRESETS[(i + 1) % INTERVAL_PRESET_COUNT];
+          advanced = true;
+          break;
+        }
+      }
+      // current value not one of the presets (e.g. changed some other way) -
+      // just snap to the first preset rather than silently doing nothing
+      if (!advanced) appTxDutyCycle = INTERVAL_PRESETS[0];
+    } else if (choice == 2) {
+      Serial.println("Clearing saved LoRaWAN state from menu");
+      lorawanPrefs.begin("lorawan", false);
+      lorawanPrefs.remove("nonces");
+      lorawanPrefs.remove("session");
+      lorawanPrefs.end();
+      oledStatus("Cleared!", "Rebooting...");
+      delay(1500);
+      ESP.restart();
+    } else {
+      break; // Back or timeout
+    }
+  }
+}
+
+static void runTopMenu()
+{
+  String items[] = { "Send now", "Status", "WiFi info", "Settings", "< Back" };
+  int choice = runMenuLevel(items, 5);
+
+  switch (choice) {
+    case 0: manualSendRequested = true; break;
+    case 1: showStatusScreen(); break;
+    case 2: showWifiInfoScreen(); break;
+    case 3: runSettingsMenu(); break;
+    default: break; // Back or timeout
+  }
+}
+
 // PRG button: any press wakes the screen for a fresh 10s even if it was
-// blanked; holding it for 1s forces whatever this wait is for to happen now
-// (skips the rest of the wait) - same manualSendRequested flag the web
-// "send now" button uses, so during a join retry it means "try again now"
-// and during the uplink cycle it means "send now".
+// blanked; holding it (~1s) opens the menu above.
 static void waitWithCountdown(uint32_t totalMs, const String &line1, const String &line2,
                                const String &line3Prefix, uint32_t blankAfterMs = 10000)
 {
@@ -732,8 +912,9 @@ static void waitWithCountdown(uint32_t totalMs, const String &line1, const Strin
       buttonWakeUntil = millis() + 10000;
     }
     if (button.pressedFor(1000)) {
-      Serial.println("Button held 1s - forcing action now");
-      manualSendRequested = true;
+      Serial.println("Button held 1s - opening menu");
+      runTopMenu();
+      buttonWakeUntil = millis() + 10000;   // stay awake briefly after closing the menu
     }
 
     if (manualSendRequested) {
