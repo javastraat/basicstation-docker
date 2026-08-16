@@ -35,15 +35,32 @@ services:
     #  - cups.trust
     #  - cups.crt
     #  - cups.key
-       
-    #environment:
 
-      # To select your concentrator you have 3 options:
-      # Option 1: set the MODEL to the device model number (i.e. RAK7371)
-      # Option 2: set the MODEL to the concentrator model number (i.e. RAK5146, WM1302, R11E-LR8...)
-      # Option 2: set the MODEL to the concentrator chip (i.e. SX1303)
-      #MODEL: "RAK5146"
-      #MODEL: "SX1303"
+    environment:
+
+      # RAK2287 = SX1302-based CoreCell design, SPI interface. DESIGN/INTERFACE/
+      # DEVICE are all inferred correctly from MODEL alone, no need to set them.
+      MODEL: "RAK2287"
+
+      # CoreCell concentrators (RAK2287 included) can report their own real,
+      # stable hardware chip ID as the Gateway EUI - better than deriving it
+      # from the Pi's network MAC (which changes if you swap the Pi/NIC).
+      #
+      # FIRST RUN: leave TC_KEY commented out below and start the container.
+      # It won't be able to authenticate to TTN yet, but it will log the
+      # chip-derived Gateway EUI on startup - copy that value, use it to
+      # register a gateway in TTN Console (frequency plan EU_863_870_TTN),
+      # generate an API key for it, then set TC_KEY below and restart.
+      GATEWAY_EUI_SOURCE: "chip"
+
+      # EU868 / The Things Stack Community Edition, EU cluster - derives
+      # TC_URI/CUPS_URI automatically. Change if you're on a different
+      # region/tenant (see commented TTS_REGION/TTS_TENANT docs below).
+      TTS_REGION: "eu1"
+
+      # Gateway API key from TTN Console (Gateways > your gateway > API keys).
+      # Comes from .env (gitignored) - copy .env.example to .env and fill in.
+      TC_KEY: "${TC_KEY}"
 
       # The concentrator design is usually taken from the MODEL (see https://doc.sm.tc/station):
       # * V2 design was used with SX1301 and SX1308 concentrators with SPI interface

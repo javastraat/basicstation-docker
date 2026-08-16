@@ -1,6 +1,7 @@
-# Ignore all dotfiles except .gitignore
+# Ignore all dotfiles except .gitignore and .env.example
 .*
 !.gitignore
+!.env.example
 
 # Private builder
 build_private.sh
