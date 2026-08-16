@@ -53,11 +53,14 @@ services:
     environment:
 
       # RAK2287 = SX1302-based CoreCell design, SPI interface. DESIGN/INTERFACE
-      # are inferred correctly from MODEL alone. DEVICE is pinned explicitly
-      # below since auto-discovery found it on chip-select 1, not the more
-      # commonly documented spidev0.0 (depends on how your HAT is wired).
+      # are inferred correctly from MODEL alone.
+      #
+      # DEVICE tried spidev0.1 first (what auto-discovery originally reported)
+      # but that returned chip version 0x00 - i.e. nothing actually answering
+      # on that SPI line, so the "discovery" never really confirmed real
+      # hardware. Trying the far more standard spidev0.0 (chip-select 0) now.
       MODEL: "RAK2287"
-      DEVICE: "/dev/spidev0.1"
+      DEVICE: "/dev/spidev0.0"
 
       # GATEWAY_EUI_SOURCE=chip was tried and doesn't work on this image for
       # CoreCell hardware: the standalone chip_id probe in runner/start runs
