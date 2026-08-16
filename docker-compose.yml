@@ -59,16 +59,15 @@ services:
       MODEL: "RAK2287"
       DEVICE: "/dev/spidev0.1"
 
-      # CoreCell concentrators (RAK2287 included) can report their own real,
-      # stable hardware chip ID as the Gateway EUI - better than deriving it
-      # from the Pi's network MAC (which changes if you swap the Pi/NIC).
-      #
-      # FIRST RUN: leave TC_KEY commented out below and start the container.
-      # It won't be able to authenticate to TTN yet, but it will log the
-      # chip-derived Gateway EUI on startup - copy that value, use it to
-      # register a gateway in TTN Console (frequency plan EU_863_870_TTN),
-      # generate an API key for it, then set TC_KEY below and restart.
-      GATEWAY_EUI_SOURCE: "chip"
+      # GATEWAY_EUI_SOURCE=chip was tried and doesn't work on this image for
+      # CoreCell hardware: the standalone chip_id probe in runner/start runs
+      # *before* the concentrator's GPIO reset (which only happens later,
+      # inside the actual `station` binary via STATION_RADIOINIT), so the
+      # SX1302 never responds and it silently falls back to the eth0 MAC
+      # anyway. Confirmed reproducible (identical EUI) across 4 separate
+      # test runs, so falling back to the eth0-derived EUI deliberately
+      # instead - it's a real, stable hardware property (the Pi's NIC MAC),
+      # not a fluke. Registered in TTN Console: DCA632FFFE8FD589
 
       # EU868 / The Things Stack Community Edition, EU cluster - derives
       # TC_URI/CUPS_URI automatically. Change if you're on a different
