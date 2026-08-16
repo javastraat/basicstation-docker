@@ -3,7 +3,7 @@ services:
   basicstation:
     
     # Use pre-defined image
-    image: xoseperez/basicstation:latest
+    image: docker.io/xoseperez/basicstation:latest
     
     # Or comment out image and build it yourself
     #build:

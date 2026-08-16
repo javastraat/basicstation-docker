@@ -41,7 +41,7 @@ LoRaWANNode node(&radio, &Region, subBand);
 uint8_t appPort = 2;
 
 // Send interval (ms) - keep fair use in mind
-uint32_t appTxDutyCycle = 60000;
+uint32_t appTxDutyCycle = 120000;
 
 // -------------------- App payload --------------------
 static uint32_t uplinkCount = 0;
