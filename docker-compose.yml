@@ -33,8 +33,12 @@ services:
     #  - /dev/spidev0.0       # share the device where your concentrator is connected to or set privileged to true above
     #  - /dev/gpiochip0       # allow the container to access the GPIO (via gpiod) if using an SPI concentrator or set privileged to true above
     
-    #volumes:
-    #  - ./config:/app/config
+    # Bind-mounted (not an anonymous volume) so station.conf - which caches
+    # the Gateway EUI and takes priority over GATEWAY_EUI_SOURCE entirely -
+    # is something you can see and delete on the host, instead of it hiding
+    # in container storage across "down"/"up" cycles.
+    volumes:
+      - ./config:/app/config
 
     #secrets:
     #  - tc.uri
