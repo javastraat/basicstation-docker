@@ -24,7 +24,6 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
-#include <HTTPUpdateServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <ArduinoOTA.h>
@@ -69,7 +68,6 @@ uint32_t joinRetryInterval = 30000;
 // anything. STA connect, falling back to a local AP if that fails, so the
 // node is always reachable somehow.
 WebServer server(80);
-HTTPUpdateServer httpUpdater;
 bool wifiEnabled = false;
 bool apMode = false;
 String sessionToken = "";           // empty = nobody logged in
@@ -78,6 +76,7 @@ bool joined = false;
 float lastRSSI = 0;
 float lastSNR = 0;
 float lastTempC = 0;
+uint32_t lastSendMillis = 0;
 
 // -------------------- App payload --------------------
 static uint32_t uplinkCount = 0;
@@ -791,25 +790,134 @@ static void handleLogoImage()
   server.send_P(200, "image/jpeg", (PGM_P)logoJpeg, sizeof(logoJpeg));
 }
 
-// #005BAC = logo's solid background blue, sampled from logo.png. Page
-// background matches it so the logo's square edges disappear and only the
-// white icon linework appears to float on the page.
+// #005BAC = logo's solid background blue, sampled from logo.png.
 static const char *LOGO_BLUE = "#005BAC";
+
+// Three themes, picked with buttons at the top of the page, persisted in
+// localStorage (client-side only, nothing server-side to track):
+//  - dark-reverse: the original look - solid blue bg, white text (default)
+//  - dark:         near-black bg, blue accents/headings, light body text
+//                   (pure blue-on-black for body copy reads poorly, so body
+//                   text is a soft light grey instead - accents/headings
+//                   still carry the blue)
+//  - light:        light bg, same blue accents/headings, dark body text
+static const char PAGE_CSS[] = R"CSS(
+:root, [data-theme="dark-reverse"] {
+  --bg:#005BAC; --card-bg:rgba(255,255,255,.10); --text:#fff; --text-dim:rgba(255,255,255,.75);
+  --accent:#fff; --border:rgba(255,255,255,.22); --btn-bg:#fff; --btn-text:#005BAC;
+}
+[data-theme="dark"] {
+  --bg:#0e0e10; --card-bg:#1a1a1d; --text:#e8e8ea; --text-dim:#9a9aa0;
+  --accent:#4da3ff; --border:#2a2a2e; --btn-bg:#005BAC; --btn-text:#fff;
+}
+[data-theme="light"] {
+  --bg:#eef1f5; --card-bg:#fff; --text:#1a1d23; --text-dim:#5b6472;
+  --accent:#005BAC; --border:#dfe3e8; --btn-bg:#005BAC; --btn-text:#fff;
+}
+* { box-sizing:border-box; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:var(--bg); color:var(--text); transition:background .2s,color .2s; }
+.topbar { display:flex; align-items:center; gap:12px; padding:18px 20px; flex-wrap:wrap; }
+.topbar img { width:40px; height:40px; border-radius:8px; display:block; }
+.topbar h1 { font-size:1.25rem; margin:0; flex:1; min-width:120px; }
+.theme-switch { display:flex; gap:6px; }
+.theme-switch button { border:1px solid var(--border); background:transparent; color:var(--text);
+  padding:6px 12px; border-radius:8px; cursor:pointer; font-size:.8rem; }
+.theme-switch button.active { background:var(--accent); color:var(--bg); border-color:var(--accent); }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px;
+  padding:0 20px 24px; max-width:1100px; }
+.card { background:var(--card-bg); border:1px solid var(--border); border-radius:14px; padding:18px; }
+.card h2 { margin:0 0 12px; font-size:.82rem; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--accent); }
+.row { display:flex; justify-content:space-between; gap:12px; padding:6px 0;
+  border-bottom:1px solid var(--border); font-size:.92rem; }
+.row:last-child { border-bottom:none; }
+.row span:first-child { color:var(--text-dim); }
+.row span:last-child { text-align:right; word-break:break-all; }
+.btn { display:inline-block; background:var(--btn-bg); color:var(--btn-text); border:none;
+  padding:11px 22px; border-radius:9px; font-size:.95rem; cursor:pointer; font-weight:600; }
+.center { text-align:center; }
+.login-card { max-width:320px; margin:60px auto; }
+.login-card img { width:100px; display:block; margin:0 auto 16px; border-radius:14px; }
+.login-card input { width:100%; padding:10px; font-size:16px; margin-top:12px; border:1px solid var(--border);
+  border-radius:8px; background:var(--card-bg); color:var(--text); }
+.login-card .btn { width:100%; margin-top:14px; }
+.err { color:#ff8a8a; font-size:.85rem; margin-top:10px; }
+.foot { padding:4px 20px 24px; font-size:.8rem; }
+.foot a { color:var(--text-dim); }
+)CSS";
+
+// No-FOUC theme init (runs before body renders) + the switcher buttons'
+// wiring, shared by every page.
+static String htmlHead(const String &title, bool refresh15 = false)
+{
+  String h = "<!DOCTYPE html><html><head>";
+  h += "<script>(function(){var t=localStorage.getItem('theme')||'dark-reverse';"
+       "document.documentElement.setAttribute('data-theme',t);})();</script>";
+  h += "<title>" + title + "</title>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  if (refresh15) h += "<meta http-equiv='refresh' content='15'>";
+  h += "<style>" + String(PAGE_CSS) + "</style></head><body>";
+  return h;
+}
+
+static String themeSwitcher()
+{
+  return "<div class='theme-switch'>"
+         "<button data-t='light'>Light</button>"
+         "<button data-t='dark'>Dark</button>"
+         "<button data-t='dark-reverse'>Blue</button>"
+         "</div>";
+}
+
+static const char THEME_SCRIPT[] = R"JS(
+<script>
+function setTheme(t){
+  localStorage.setItem('theme',t);
+  document.documentElement.setAttribute('data-theme',t);
+  document.querySelectorAll('.theme-switch button').forEach(function(b){
+    b.classList.toggle('active', b.dataset.t===t);
+  });
+}
+document.querySelectorAll('.theme-switch button').forEach(function(b){
+  b.onclick=function(){ setTheme(b.dataset.t); };
+});
+setTheme(localStorage.getItem('theme')||'dark-reverse');
+</script>
+)JS";
+
+static String cardRow(const String &label, const String &value)
+{
+  return "<div class='row'><span>" + label + "</span><span>" + value + "</span></div>";
+}
+
+static String formatUptime(uint32_t seconds)
+{
+  uint32_t d = seconds / 86400;
+  uint32_t h = (seconds % 86400) / 3600;
+  uint32_t m = (seconds % 3600) / 60;
+  uint32_t s = seconds % 60;
+  String out = "";
+  if (d) out += String(d) + "d ";
+  if (d || h) out += String(h) + "h ";
+  if (d || h || m) out += String(m) + "m ";
+  out += String(s) + "s";
+  return out;
+}
 
 static void handleLoginPage()
 {
-  String html = "<!DOCTYPE html><html><head><title>ttn-heltecv4</title>"
-                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<style>body{font-family:sans-serif;background:" + String(LOGO_BLUE) + ";"
-                "color:#fff;text-align:center;padding-top:40px}img{width:120px}"
-                "input{padding:8px;font-size:16px;margin-top:10px;border:none;border-radius:4px}"
-                "button{padding:8px 20px;font-size:16px;margin-top:10px;border:none;"
-                "border-radius:4px;background:#fff;color:" + String(LOGO_BLUE) + ";cursor:pointer}"
-                "</style></head><body><img src='/logo.jpg'><h2>ttn-heltecv4</h2>"
-                "<form method='POST' action='/login'>"
-                "<input type='password' name='password' placeholder='Password' autofocus><br>"
-                "<button type='submit'>Login</button></form>";
-  if (server.hasArg("error")) html += "<p style='color:#fbb'>Wrong password</p>";
+  String html = htmlHead("ttn-heltecv4 - Login");
+  html += "<div class='topbar'><div style='flex:1'></div>" + themeSwitcher() + "</div>";
+  html += "<div class='login-card card'>";
+  html += "<img src='/logo.jpg'>";
+  html += "<h2 class='center' style='margin-top:0'>ttn-heltecv4</h2>";
+  html += "<form method='POST' action='/login'>"
+          "<input type='password' name='password' placeholder='Password' autofocus>"
+          "<button class='btn' type='submit'>Login</button></form>";
+  if (server.hasArg("error")) html += "<p class='err center'>Wrong password</p>";
+  html += "</div>";
+  html += THEME_SCRIPT;
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -859,32 +967,54 @@ static void handleRoot()
     return;
   }
 
-  String html = "<!DOCTYPE html><html><head><title>ttn-heltecv4</title>"
-                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<meta http-equiv='refresh' content='15'>"
-                "<style>body{font-family:sans-serif;background:" + String(LOGO_BLUE) + ";"
-                "color:#fff;padding:20px}"
-                "img{width:60px;float:left;margin-right:15px}"
-                "table{border-collapse:collapse;margin-top:20px}"
-                "td{padding:4px 12px 4px 0}"
-                "button{padding:8px 20px;font-size:16px;margin-top:15px;border:none;"
-                "border-radius:4px;background:#fff;color:" + String(LOGO_BLUE) + ";cursor:pointer}"
-                "a{color:#fff}</style></head><body>"
-                "<img src='/logo.jpg'><h2>ttn-heltecv4</h2><div style='clear:both'></div>"
-                "<table>";
-  html += "<tr><td>Joined</td><td>" + String(joined ? "yes" : "no") + "</td></tr>";
-  html += "<tr><td>DevEUI</td><td>" + hex64(devEUI) + "</td></tr>";
-  html += "<tr><td>Uplinks sent</td><td>" + String(uplinkCount) + "</td></tr>";
-  html += "<tr><td>Last temp</td><td>" + String(lastTempC, 1) + " &deg;C</td></tr>";
-  html += "<tr><td>Last downlink RSSI</td><td>" + String(lastRSSI, 1) + " dBm</td></tr>";
-  html += "<tr><td>Last downlink SNR</td><td>" + String(lastSNR, 1) + " dB</td></tr>";
-  html += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB</td></tr>";
-  html += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
-  html += "<tr><td>Network mode</td><td>" + String(apMode ? "AP (fallback)" : "WiFi STA") + "</td></tr>";
-  html += "<tr><td>IP</td><td>" + (apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "</td></tr>";
-  html += "</table>";
-  html += "<form method='POST' action='/send'><button type='submit'>Send uplink now</button></form>";
-  html += "<p><a href='/update'>Firmware update (OTA)</a> &middot; <a href='/logout'>Logout</a></p>";
+  String html = htmlHead("ttn-heltecv4", true);
+  html += "<div class='topbar'><img src='/logo.jpg'><h1>ttn-heltecv4</h1>" + themeSwitcher() + "</div>";
+  html += "<div class='cards'>";
+
+  // ---- ESP32 card ----
+  html += "<div class='card'><h2>ESP32</h2>";
+  html += cardRow("Chip", String(ESP.getChipModel()) + " rev" + String(ESP.getChipRevision()));
+  html += cardRow("CPU freq", String(ESP.getCpuFreqMHz()) + " MHz");
+  html += cardRow("Free heap", String(ESP.getFreeHeap() / 1024) + " KB");
+  html += cardRow("Min free heap", String(ESP.getMinFreeHeap() / 1024) + " KB");
+  html += cardRow("Flash size", String(ESP.getFlashChipSize() / (1024 * 1024)) + " MB");
+  html += cardRow("Uptime", formatUptime(millis() / 1000));
+  html += "</div>";
+
+  // ---- WiFi card ----
+  html += "<div class='card'><h2>WiFi</h2>";
+  html += cardRow("Mode", apMode ? "AP (fallback)" : "STA");
+  html += cardRow("SSID", apMode ? String(SECRET_AP_SSID) : WiFi.SSID());
+  html += cardRow("IP", apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
+  if (!apMode) html += cardRow("RSSI", String(WiFi.RSSI()) + " dBm");
+  html += cardRow("MAC", WiFi.macAddress());
+  html += cardRow("Hostname", "ttn-heltecv4.local");
+  html += "</div>";
+
+  // ---- LoRaWAN card ----
+  html += "<div class='card'><h2>LoRaWAN</h2>";
+  html += cardRow("Joined", joined ? "yes" : "no");
+  html += cardRow("DevEUI", hex64(devEUI));
+  if (joined) html += cardRow("DevAddr", String((unsigned long)node.getDevAddr(), HEX));
+  html += cardRow("Region / Class", "EU868 / A");
+  html += cardRow("Uplinks sent", String(uplinkCount));
+  html += cardRow("Last downlink RSSI", String(lastRSSI, 1) + " dBm");
+  html += cardRow("Last downlink SNR", String(lastSNR, 1) + " dB");
+  html += "</div>";
+
+  // ---- Send status card ----
+  html += "<div class='card'><h2>Send status</h2>";
+  html += cardRow("Last temperature", String(lastTempC, 1) + " &deg;C");
+  uint32_t sinceLast = lastSendMillis ? (millis() - lastSendMillis) / 1000 : 0;
+  html += cardRow("Last send", lastSendMillis ? (formatUptime(sinceLast) + " ago") : "never yet");
+  html += cardRow("Send interval", String(appTxDutyCycle / 1000) + "s (approx)");
+  html += "<form method='POST' action='/send' class='center' style='margin-top:14px'>"
+          "<button class='btn' type='submit'>Send uplink now</button></form>";
+  html += "</div>";
+
+  html += "</div>"; // .cards
+  html += "<div class='foot'><a href='/logout'>Logout</a></div>";
+  html += THEME_SCRIPT;
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -942,20 +1072,8 @@ static void wifiSetup()
   server.on("/send", HTTP_POST, handleSend);
   server.on("/logo.jpg", HTTP_GET, handleLogoImage);
 
-  // Separate auth mechanism (HTTP Basic, browser-native popup) just for the
-  // OTA upload page - HTTPUpdateServer wires this up itself, no need to
-  // reimplement upload handling to match the cookie-login used elsewhere.
-  httpUpdater.setup(&server, "/update", "admin", SECRET_WEB_PASSWORD);
-
-  // MUST come after httpUpdater.setup(): collectHeaders() unconditionally
-  // resets the *entire* header collection list every time it's called
-  // (it calls collectAllHeaders() -> _clearRequestHeaders() internally), and
-  // HTTPUpdateServer::setup() calls it for its own Origin/Host CSRF check.
-  // Whichever collectHeaders() call happens last wins - so this one combined
-  // call listing everything needed (ours + theirs) has to be the last one,
-  // not two separate calls in either order.
-  const char *headerKeys[] = { "Cookie", "Origin", "Host" };
-  server.collectHeaders(headerKeys, 3);
+  const char *headerKeys[] = { "Cookie" };
+  server.collectHeaders(headerKeys, 1);
 
   server.begin();
   wifiEnabled = true;
@@ -963,9 +1081,7 @@ static void wifiSetup()
 
   // ArduinoOTA: lets the Arduino IDE (or arduino-cli) flash over WiFi like a
   // normal USB upload - the device just shows up as a network port instead
-  // of a serial one, discovered via the same mDNS hostname. Kept alongside
-  // the web-form-based /update (HTTPUpdateServer) rather than replacing it:
-  // that one works from a plain browser (e.g. a phone) with no IDE needed.
+  // of a serial one, discovered via the same mDNS hostname.
   ArduinoOTA.setHostname("ttn-heltecv4");
   ArduinoOTA.setPassword(SECRET_WEB_PASSWORD);
   ArduinoOTA.onStart([]() {
@@ -1201,6 +1317,7 @@ void loop()
   }
 
   uplinkCount++;
+  lastSendMillis = millis();
   oledStatus("STATE: SEND", "Uplink #" + String(uplinkCount),
              "Temp: " + String(lastTempC, 1) + " C");
   Serial.printf("Uplink #%lu done\n", (unsigned long)uplinkCount);
