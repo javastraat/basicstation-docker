@@ -62,6 +62,11 @@ services:
       MODEL: "RAK2287"
       DEVICE: "/dev/spidev0.0"
 
+      # Default reset pin (GPIO17) fired but chip still reads version 0x00 -
+      # some RAK2287 HAT batches/clones wire reset to GPIO22 instead. Trying
+      # that alongside the device change.
+      RESET_GPIO: 22
+
       # GATEWAY_EUI_SOURCE=chip was tried and doesn't work on this image for
       # CoreCell hardware: the standalone chip_id probe in runner/start runs
       # *before* the concentrator's GPIO reset (which only happens later,
