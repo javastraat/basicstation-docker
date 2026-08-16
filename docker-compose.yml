@@ -18,6 +18,16 @@ services:
     privileged: true         # set this to true or define the required devices to share with the container under the `devices` tag below
     network_mode: host       # required to read host interface MAC instead of virtual one, you don't need this if you set the GATEWAY_EUI manually
 
+    # Rootless Podman doesn't grant GPIO/SPI/serial device access via
+    # privileged: true the way Docker does - it needs the container process
+    # to inherit the invoking host user's groups instead. Without this, GPIO
+    # access gets silently denied (see gpiodetect/GPS permission errors),
+    # which also breaks GATEWAY_EUI_SOURCE=chip (falls back to the eth0 MAC).
+    # Requires the `pi` user to actually be a member of the relevant host
+    # groups (gpio/spi/dialout - check with `groups pi`, add with usermod).
+    group_add:
+      - keep-groups
+
     #devices:
     #  - /dev/ttyACM0         # share the device where your concentrator is connected to or set privileged to true above
     #  - /dev/spidev0.0       # share the device where your concentrator is connected to or set privileged to true above
@@ -38,9 +48,12 @@ services:
 
     environment:
 
-      # RAK2287 = SX1302-based CoreCell design, SPI interface. DESIGN/INTERFACE/
-      # DEVICE are all inferred correctly from MODEL alone, no need to set them.
+      # RAK2287 = SX1302-based CoreCell design, SPI interface. DESIGN/INTERFACE
+      # are inferred correctly from MODEL alone. DEVICE is pinned explicitly
+      # below since auto-discovery found it on chip-select 1, not the more
+      # commonly documented spidev0.0 (depends on how your HAT is wired).
       MODEL: "RAK2287"
+      DEVICE: "/dev/spidev0.1"
 
       # CoreCell concentrators (RAK2287 included) can report their own real,
       # stable hardware chip ID as the Gateway EUI - better than deriving it
