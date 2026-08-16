@@ -40,8 +40,13 @@ LoRaWANNode node(&radio, &Region, subBand);
 // -------------------- LoRaWAN behavior --------------------
 uint8_t appPort = 2;
 
-// Send interval (ms) - keep fair use in mind
-uint32_t appTxDutyCycle = 60000;
+// Uplink send interval (ms) - keep fair use in mind
+uint32_t appTxDutyCycle = 120000;
+
+// Join-retry interval (ms) - separate from appTxDutyCycle. A join-request is
+// a single small frame, less airtime-constrained than a data uplink, so it's
+// fine (and much nicer while testing) for this to be shorter.
+uint32_t joinRetryInterval = 30000;
 
 // -------------------- App payload --------------------
 static uint32_t uplinkCount = 0;
@@ -207,11 +212,9 @@ void setup()
     RADIOLIB(state);
     Serial.println(lorawanStateDecode(state));
     if (state != RADIOLIB_LORAWAN_NEW_SESSION && state != RADIOLIB_LORAWAN_SESSION_RESTORED) {
-      // Join-requests count against duty-cycle/fair-use limits just like
-      // uplinks, so retries wait the same appTxDutyCycle interval.
       uint32_t waitStart = millis();
-      while (millis() - waitStart < appTxDutyCycle) {
-        uint32_t remaining = appTxDutyCycle - (millis() - waitStart);
+      while (millis() - waitStart < joinRetryInterval) {
+        uint32_t remaining = joinRetryInterval - (millis() - waitStart);
         oledStatus("STATE: JOIN", "Join failed (#" + String(attempt) + ")",
                    "Retry in " + String(remaining / 1000) + "s");
         delay(1000);
