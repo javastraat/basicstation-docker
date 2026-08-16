@@ -41,7 +41,7 @@ LoRaWANNode node(&radio, &Region, subBand);
 uint8_t appPort = 2;
 
 // Send interval (ms) - keep fair use in mind
-uint32_t appTxDutyCycle = 120000;
+uint32_t appTxDutyCycle = 60000;
 
 // -------------------- App payload --------------------
 static uint32_t uplinkCount = 0;
@@ -92,13 +92,18 @@ static void printHex(const uint8_t *buf, size_t len)
   for (size_t i = 0; i < len; i++) Serial.printf("%02X", buf[i]);
 }
 
-// Build payload
+// Build payload: 2 bytes, big-endian int16 of (temperature_C * 100).
+// Matching TTN payload formatter decodes this back to a "temperature" field
+// - see the JS snippet in the repo notes / ask for it again if needed.
+static float lastTempC = 0;
+
 static void prepareTxFrame(uint8_t *buf, uint8_t &len)
 {
-  static uint8_t counter = 0;
+  lastTempC = heltec_temperature();
+  int16_t scaled = (int16_t)round(lastTempC * 100);
   len = 2;
-  buf[0] = counter++;
-  buf[1] = (uint8_t)random(0, 255);
+  buf[0] = (uint8_t)(scaled >> 8);
+  buf[1] = (uint8_t)(scaled & 0xFF);
 }
 
 // The RADIOLIB()/RADIOLIB_OR_HALT() macros from heltec_unofficial.h only
@@ -228,6 +233,7 @@ void loop()
   uint8_t payloadLen;
   prepareTxFrame(payload, payloadLen);
 
+  Serial.printf("Chip temperature: %.2f C\n", lastTempC);
   Serial.printf("Payload (%d bytes): ", payloadLen);
   printHex(payload, payloadLen);
   Serial.println();
@@ -255,7 +261,8 @@ void loop()
   }
 
   uplinkCount++;
-  oledStatus("STATE: SEND", "Uplink #" + String(uplinkCount), "fPort: " + String(appPort));
+  oledStatus("STATE: SEND", "Uplink #" + String(uplinkCount),
+             "Temp: " + String(lastTempC, 1) + " C");
   Serial.printf("Uplink #%lu done\n", (unsigned long)uplinkCount);
 
   uint32_t waitMs = appTxDutyCycle + random(-3000, 3000);
