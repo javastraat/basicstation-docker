@@ -4,3 +4,6 @@
 
 # Private builder
 build_private.sh
+
+# Device credentials (see ttn-heltecv4/secrets.h.example for the template)
+ttn-heltecv4/secrets.h
