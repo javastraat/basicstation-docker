@@ -21,12 +21,20 @@ services:
     # Rootless Podman doesn't grant GPIO/SPI/serial device access via
     # privileged: true the way Docker does - it needs the container process
     # to inherit the invoking host user's groups instead. Without this, GPIO
-    # access gets silently denied (see gpiodetect/GPS permission errors),
-    # which also breaks GATEWAY_EUI_SOURCE=chip (falls back to the eth0 MAC).
-    # Requires the `pi` user to actually be a member of the relevant host
-    # groups (gpio/spi/dialout - check with `groups pi`, add with usermod).
+    # access gets silently denied (see gpiodetect/GPS permission errors).
+    #
+    # Explicit numeric GIDs, not the "keep-groups" magic value: that only
+    # works through Podman's own CLI/compose, not through Portainer (which
+    # talks to Podman via its Docker-API-compatible socket and just tries to
+    # look up "keep-groups" as a literal group name and fails). Numeric GIDs
+    # work through both. Get these on the host with:
+    #   getent group gpio spi dialout
+    # (gpio=986, spi=989, dialout=20 on this Pi - re-check if you image a
+    # different one, GIDs aren't guaranteed stable across installs)
     group_add:
-      - keep-groups
+      - "986"   # gpio
+      - "989"   # spi
+      - "20"    # dialout
 
     #devices:
     #  - /dev/ttyACM0         # share the device where your concentrator is connected to or set privileged to true above
