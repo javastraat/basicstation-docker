@@ -9,6 +9,7 @@ build_private.sh
 # Device credentials (see ttn-heltecv4/secrets.h.example for the template)
 ttn-heltecv4/secrets.h
 ttn-heltecv3/secrets.h
+ttn-heltec/secrets.h
 
 # Live basicstation state (station.conf w/ EUI, session data) - bind mounted
 # from docker-compose.yml, host-local runtime state, not source

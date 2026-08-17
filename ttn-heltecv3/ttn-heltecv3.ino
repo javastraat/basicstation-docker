@@ -26,6 +26,22 @@
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 
+// Defined up here, not next to pollButton() further down, because Arduino's
+// sketch preprocessor auto-generates a forward declaration for every
+// function at the very top of the translation unit (a brace-counting
+// heuristic, not a real parser) - if this struct were defined later, that
+// auto-generated "static ButtonEvent pollButton();" prototype wouldn't be
+// able to see the type yet. Same "auto-prototype loses scope" issue
+// meshpoint's pager_client.ino's own header comment documents (there, for a
+// raw HTML string literal instead of a struct - same root cause).
+struct ButtonEvent {
+  bool justPressed; // fires once, the instant a press debounces in - lets a
+                     // caller wake the screen immediately without waiting
+                     // for release or the long-press threshold
+  bool shortPress;
+  bool longPress;
+};
+
 // -------------------- LoRaWAN Region --------------------
 const LoRaWANBand_t Region = EU868;
 const uint8_t subBand = 0;
@@ -690,24 +706,86 @@ void oledShowBootLogo()
   delay(1800);
 }
 
-// Small status row at the top of every screen (main + menus): a WiFi dot and
-// a LoRaWAN dot, filled = good (STA connected / joined), outline = not
-// (off, AP fallback, or not yet joined). Deliberately just two dots + letters
-// rather than hand-drawn icon bitmaps - simple, always renders correctly,
-// no risk of a cramped/illegible tiny icon at this resolution.
-static void drawTopbar()
+// -------------------- Boot log (scrolling console) --------------------
+// After the splash logo, WiFi connect / radio init used to be either
+// silent (Serial-only) or a two-line status screen that got wholesale
+// replaced by the next step before there was any real chance to read it -
+// nothing to look at if there's no serial cable plugged in, and "why isn't
+// WiFi connecting" flashed past in under a second. This mirrors the same
+// milestone lines already sent to Serial onto the OLED as a small scrolling
+// console instead - oldest line falls off the top as a new one is
+// appended, same idea as watching `dmesg` scroll during a real boot.
+#define BOOT_LOG_LINES 4
+#define BOOT_LOG_LINE_H 13
+
+static String bootLogBuf[BOOT_LOG_LINES];
+static int bootLogCount = 0;
+
+static void bootLog(const String &line)
 {
+  Serial.println(line);
+
+  if (bootLogCount < BOOT_LOG_LINES) {
+    bootLogBuf[bootLogCount++] = line;
+  } else {
+    for (int i = 1; i < BOOT_LOG_LINES; i++) bootLogBuf[i - 1] = bootLogBuf[i];
+    bootLogBuf[BOOT_LOG_LINES - 1] = line;
+  }
+
+  display.displayOn();
+  display.clear();
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.drawString(0, 0, "Booting...");
+  display.drawLine(0, 11, 127, 11);
+  for (int i = 0; i < bootLogCount; i++) {
+    display.drawString(0, 13 + i * BOOT_LOG_LINE_H, bootLogBuf[i]);
+  }
+  display.display();
+}
 
-  if (wifiEnabled && !apMode) display.fillCircle(4, 5, 3);
-  else                        display.drawCircle(4, 5, 3);
-  display.drawString(10, 0, "WiFi");
+// Small vector status icons, fixed at the top-left of every screen (main +
+// menus) - deliberately on the left, not the right (the fixed-position edge
+// meshpoint's pager_client.ino uses for its own topbar icons, see that
+// file's drawTopBar()/drawWifiIcon()): this board's original Heltec V3
+// casing crops the right edge of the OLED noticeably, so anything anchored
+// there is partly hidden behind the bezel on real hardware.
+// Built from OLEDDisplay's drawCircleQuads() rather than a bitmap asset -
+// quadrant bitmask confirmed against the installed library's own
+// drawCircleQuads() source (0x1=upper-right, 0x2=upper-left, 0x4=lower-left,
+// 0x8=lower-right), same reasoning pager_client.ino's own icon comment
+// documents for its Adafruit_GFX equivalent. A dot alone means "off/not
+// joined"; the arcs only appear once actually connected, so a glance at
+// "is there an arc, or just a dot" answers the status question without
+// needing to read text - frees up the whole left side of the bar too,
+// versus the old dot+"WiFi"/dot+"LoRa" text labels.
+static void drawWifiIcon(int x, int y, bool connected)
+{
+  int cx = x + 4, cy = y + 7;
+  display.fillCircle(cx, cy, 1);
+  if (connected) {
+    display.drawCircleQuads(cx, cy, 2, 0x3); // top arc
+    display.drawCircleQuads(cx, cy, 4, 0x3);
+  }
+}
 
-  if (joined) display.fillCircle(64, 5, 3);
-  else        display.drawCircle(64, 5, 3);
-  display.drawString(70, 0, "LoRa");
+// Radio-wave glyph (dot + arcs opening to the right) for LoRaWAN join state -
+// deliberately rotated 90 degrees from the WiFi icon's top-opening arcs so
+// the two read as visually distinct glyphs at a glance, not just "two dots".
+static void drawLoraIcon(int x, int y, bool joined)
+{
+  int cx = x + 3, cy = y + 4;
+  display.fillCircle(cx, cy, 1);
+  if (joined) {
+    display.drawCircleQuads(cx, cy, 2, 0x9); // right arc
+    display.drawCircleQuads(cx, cy, 4, 0x9);
+  }
+}
 
+static void drawTopbar()
+{
+  drawWifiIcon(0, 0, wifiEnabled && !apMode);
+  drawLoraIcon(11, 0, joined);
   display.drawLine(0, 11, 127, 11);
 }
 
@@ -734,12 +812,74 @@ void oledStatus(const String &line1, const String &line2 = "", const String &lin
 // totalMs to disable blanking entirely for a given wait (used during join
 // retries - screensaver only kicks in once actually joined).
 //
-// -------------------- PRG button menu --------------------
-// Press = cycle to next item / wake screen. Hold (~800ms-1s) = select item /
-// open menu. Same pattern as old single-button devices (iPod Shuffle,
-// basic thermostats). Menu navigation needs much tighter button polling
-// than the ~1s cadence used elsewhere (waitWithCountdown), so this runs its
-// own tight-poll loop rather than trying to fit through that slower one.
+// -------------------- PRG button: edge-triggered short/long detection --------------------
+// Short press = cycle to next item / wake screen. Long-hold = select item /
+// open menu. Same pattern as old single-button devices (iPod Shuffle, basic
+// thermostats) - and the same two-gesture design meshpoint's
+// pager_client.ino uses for its own single-button state machine.
+//
+// This bypasses the `button` global's (HotButton, from heltec_unofficial.h)
+// own isSingleClick()/pressedFor() classifier: isSingleClick() waits ~250ms
+// of silence after release before confirming a click (it's watching for a
+// possible double/triple-click sequence this sketch never uses), and every
+// call site that used to poll it once per second (waitWithCountdown's own
+// delay(1000) loop) could miss a quick tap entirely between samples or take
+// up to a second to notice a long-hold. Both were the actual cause of the
+// menu feeling unresponsive. pollButton() instead tracks the raw pin with
+// its own small debounce and fires a short-press event immediately on
+// release (if no long-press already fired this cycle) or a long-press event
+// the instant the hold crosses BTN_LONG_PRESS_MS (while still held) -
+// exactly pager_client.ino's checkButton()/onShortPress()/onLongPress()
+// pattern, ported here. The `button` global itself is left alone; nothing
+// else in this sketch still calls its classifier methods.
+static const unsigned long BTN_LONG_PRESS_MS = 700;
+static const unsigned long BTN_DEBOUNCE_MS = 30;
+
+static bool btnLastRaw = HIGH;   // active-low: HIGH = released
+static bool btnDebounced = false;
+static unsigned long btnLastEdgeMs = 0;
+static unsigned long btnPressStartMs = 0;
+static bool btnLongFired = false;
+
+// Poll once per loop tick - cheap enough to call at a tight ~20-30ms cadence
+// from every wait loop in this file, which is what actually fixes the
+// responsiveness (a gesture is now noticed within one poll tick, not one
+// second).
+static ButtonEvent pollButton()
+{
+  ButtonEvent ev = { false, false, false };
+  bool raw = digitalRead(BUTTON);
+  if (raw != btnLastRaw) {
+    btnLastEdgeMs = millis();
+    btnLastRaw = raw;
+  }
+  if (millis() - btnLastEdgeMs > BTN_DEBOUNCE_MS) {
+    bool pressed = (raw == LOW);
+    if (pressed && !btnDebounced) {
+      btnDebounced = true;
+      btnPressStartMs = millis();
+      btnLongFired = false;
+      ev.justPressed = true;
+    } else if (!pressed && btnDebounced) {
+      btnDebounced = false;
+      if (!btnLongFired) ev.shortPress = true;
+    } else if (pressed && btnDebounced && !btnLongFired
+               && millis() - btnPressStartMs >= BTN_LONG_PRESS_MS) {
+      btnLongFired = true;
+      ev.longPress = true;
+    }
+  }
+  return ev;
+}
+
+// Windowed previous/current/next row layout (same visual idea as
+// meshpoint's pager_client.ino menu) - always shows the selected item with
+// one row of context above and below rather than a plain top-down dump, at
+// a roomier 14px line height instead of the old cramped 10px. A thin
+// scrollbar on the right edge shows where the selection sits in the full
+// list, same reasoning as pager_client.ino's drawScrollList().
+static const int MENU_ROW_H = 14;
+static const int MENU_TOP_Y = 13;
 
 static void oledMenuScreen(const String items[], int count, int selected)
 {
@@ -748,11 +888,22 @@ static void oledMenuScreen(const String items[], int count, int selected)
   drawTopbar();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.setFont(ArialMT_Plain_10);
-  int y = 13;
-  for (int i = 0; i < count && y <= 54; i++) {
-    display.drawString(0, y, (i == selected ? "> " : "  ") + items[i]);
-    y += 10;
+
+  for (int row = -1; row <= 1; row++) {
+    int idx = selected + row;
+    if (idx < 0 || idx >= count) continue;
+    display.drawString(0, MENU_TOP_Y + (row + 1) * MENU_ROW_H,
+                        (row == 0 ? "> " : "  ") + items[idx]);
   }
+
+  if (count > 1) {
+    int trackTop = MENU_TOP_Y, trackH = 3 * MENU_ROW_H - 2;
+    display.drawVerticalLine(127 - 2, trackTop, trackH);
+    int barH = max(4, trackH / count);
+    int barY = trackTop + (int)((float)(trackH - barH) * selected / (count - 1));
+    display.fillRect(127 - 3, barY, 3, barH);
+  }
+
   display.display();
 }
 
@@ -768,17 +919,17 @@ static int runMenuLevel(const String items[], int count)
 
   while (millis() - lastActivity < MENU_TIMEOUT_MS) {
     if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
-    button.update();
+    ButtonEvent ev = pollButton();
 
-    if (button.isSingleClick()) {
+    if (ev.shortPress) {
       selected = (selected + 1) % count;
       oledMenuScreen(items, count, selected);
       lastActivity = millis();
     }
-    if (button.pressedFor(800)) {
+    if (ev.longPress) {
       return selected;
     }
-    delay(30);
+    delay(20);
   }
   return -1;
 }
@@ -801,9 +952,9 @@ static void showDetailScreen(const String lines[], int count)
   uint32_t start = millis();
   while (millis() - start < 10000) {
     if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
-    button.update();
-    if (button.isSingleClick() || button.pressedFor(500)) break;
-    delay(30);
+    ButtonEvent ev = pollButton();
+    if (ev.shortPress || ev.longPress) break;
+    delay(20);
   }
 }
 
@@ -903,17 +1054,24 @@ static void waitWithCountdown(uint32_t totalMs, const String &line1, const Strin
   uint32_t waitStart = millis();
   bool blanked = false;
   static uint32_t buttonWakeUntil = 0;
+  // Redraw is paced separately from the poll loop below (once per second,
+  // same cadence as before) - the poll itself now runs much faster so a
+  // press is never missed, but there's no need to touch the OLED any more
+  // often than the seconds-remaining text actually changes.
+  uint32_t lastDrawnSecond = UINT32_MAX;
+
   while (millis() - waitStart < totalMs) {
     if (wifiEnabled) { server.handleClient(); ArduinoOTA.handle(); }
 
-    button.update();
-    if (button.pressed()) {
+    ButtonEvent ev = pollButton();
+    if (ev.justPressed) {
       buttonWakeUntil = millis() + 10000;
     }
-    if (button.pressedFor(1000)) {
-      Serial.println("Button held 1s - opening menu");
+    if (ev.longPress) {
+      Serial.println("Button long-held - opening menu");
       runTopMenu();
       buttonWakeUntil = millis() + 10000;   // stay awake briefly after closing the menu
+      lastDrawnSecond = UINT32_MAX;          // force a redraw, menu owned the screen
     }
 
     if (manualSendRequested) {
@@ -922,14 +1080,17 @@ static void waitWithCountdown(uint32_t totalMs, const String &line1, const Strin
     }
     uint32_t elapsed = millis() - waitStart;
     if (elapsed < blankAfterMs || millis() < buttonWakeUntil) {
-      uint32_t remaining = totalMs - elapsed;
-      oledStatus(line1, line2, line3Prefix + String(remaining / 1000) + "s");
+      uint32_t remainingSecond = (totalMs - elapsed) / 1000;
+      if (remainingSecond != lastDrawnSecond) {
+        oledStatus(line1, line2, line3Prefix + String(remainingSecond) + "s");
+        lastDrawnSecond = remainingSecond;
+      }
       blanked = false;
     } else if (!blanked) {
       display.displayOff();
       blanked = true;
     }
-    delay(1000);
+    delay(20);
   }
 }
 
@@ -1232,38 +1393,32 @@ static bool detectUsbPower()
 
 static void wifiSetup()
 {
-  Serial.println("USB power detected - enabling WiFi");
-  oledStatus("Booting...", "Connecting WiFi");
+  bootLog("Connecting WiFi...");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASSWORD);
 
-  Serial.print("Connecting to WiFi");
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(500);
-    Serial.print(".");
   }
-  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
     apMode = false;
-    Serial.print("WiFi connected, IP: ");
-    Serial.println(WiFi.localIP());
-    oledStatus("WiFi connected", WiFi.localIP().toString());
+    bootLog("WiFi connected");
+    bootLog("Got IP " + WiFi.localIP().toString());
   } else {
     apMode = true;
-    Serial.println("WiFi STA failed - starting fallback AP so the node stays reachable");
+    bootLog("WiFi failed, AP fallback");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(SECRET_AP_SSID, SECRET_AP_PASSWORD);
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
-    oledStatus("WiFi AP fallback", SECRET_AP_SSID, WiFi.softAPIP().toString());
+    bootLog("AP: " + String(SECRET_AP_SSID));
+    bootLog("AP IP " + WiFi.softAPIP().toString());
   }
   delay(1500);
 
   if (MDNS.begin("ttn-heltecv3")) {
-    Serial.println("mDNS: http://ttn-heltecv3.local");
+    bootLog("mDNS ready");
     MDNS.addService("http", "tcp", 80);
   }
 
@@ -1279,7 +1434,7 @@ static void wifiSetup()
 
   server.begin();
   wifiEnabled = true;
-  Serial.println("Web server started");
+  bootLog("Web server started");
 
   // ArduinoOTA: lets the Arduino IDE (or arduino-cli) flash over WiFi like a
   // normal USB upload - the device just shows up as a network port instead
@@ -1303,7 +1458,7 @@ static void wifiSetup()
     oledStatus("OTA UPDATE", "Error " + String(error));
   });
   ArduinoOTA.begin();
-  Serial.println("ArduinoOTA ready");
+  bootLog("ArduinoOTA ready");
 }
 
 // Build payload: 2 bytes, big-endian int16 of (temperature_C * 100).
@@ -1396,15 +1551,24 @@ void setup()
   heltec_setup();   // Serial.begin(115200) + SPI + OLED init/reset
   delay(300);
 
+  // pollButton() (see that function's own comment) reads this pin directly
+  // rather than going through the `button` global's own HotButton::update(),
+  // which only calls pinMode(pin, INPUT) - i.e. relies on GPIO0 already
+  // having a hardware pull-up (true on this board, since it doubles as the
+  // BOOT pin, but not asserted anywhere in code until now). Explicit here
+  // so pollButton() doesn't inherit that assumption silently.
+  pinMode(BUTTON, INPUT_PULLUP);
+
   oledShowBootLogo();
 
   if (detectUsbPower()) {
+    bootLog("USB power detected");
     wifiSetup();
   } else {
-    Serial.println("Battery power detected - WiFi stays off to save power");
+    bootLog("Battery power, WiFi off");
   }
 
-  oledStatus("Booting...", "Init radio");
+  bootLog("Init radio...");
 
   Serial.println("\n===================================");
   Serial.println("Heltec V3 TTN EU868 OTAA + OLED");
@@ -1418,6 +1582,7 @@ void setup()
 
   Serial.println("STATE: INIT radio");
   RADIOLIB_OR_HALT(radio.begin());
+  bootLog("Radio ready");
 
   RADIOLIB(node.beginOTAA(joinEUI, devEUI, nwkKey, appKey));
 

@@ -1,5 +1,19 @@
 /*
-  Heltec WiFi LoRa 32 V4 + TTN EU868 OTAA + OLED status/boot screen
+  Heltec WiFi LoRa 32 (V3 or V4) + TTN EU868 OTAA + OLED status/boot screen
+
+  One sketch for both board revisions - they share identical OLED/radio/Vext
+  pin mappings (verified against this Arduino core's pins_arduino.h for both
+  variants), so there was never a real code difference between the old
+  separate ttn-heltecv3/ and ttn-heltecv4/ sketches, just duplicated
+  maintenance (every fix had to be hand-ported between the two - see git
+  history). Which board you're actually running on is picked up
+  automatically from ARDUINO_HELTEC_WIFI_LORA_32_V3/_V4, a macro the ESP32
+  core's own platform.txt already defines from the board you select in the
+  IDE/--fqbn (confirmed in that installed platform.txt's recipe.cpp.o.pattern:
+  -DARDUINO_{build.board}) - you still have to pick V3 vs V4 there regardless
+  (their flash partition sizes differ), so this just reads a value you were
+  always going to set anyway instead of asking you to also set it here. See
+  BOARD_VARIANT_LABEL below.
 
   Uses the community "Heltec_ESP32_LoRa_v3" (heltec_unofficial.h) board
   library + RadioLib's LoRaWAN stack instead of Heltec's own official
@@ -7,15 +21,17 @@
   per-chip "license" check (visible on serial as "Please provide a correct
   license!") that blocks Mcu.begin() from ever returning on unlicensed
   boards - this stack talks to the SX1262 directly via RadioLib and has no
-  such gate. V3 and V4 boards share identical OLED/radio/Vext pin mappings
-  (verified against this Arduino core's pins_arduino.h for both variants),
-  so the V3-branded library works fine here.
+  such gate.
 
   1) Copy secrets.h.example to secrets.h and fill in your TTN OTAA
-     credentials (secrets.h is gitignored, never committed)
-  2) Select "Heltec WiFi LoRa 32(V4)" board, any USB Mode/CDC On Boot
-     setting works since we no longer depend on Heltec's own USB stack
-     quirks for this
+     credentials (secrets.h is gitignored, never committed). secrets.h now
+     holds every physical unit's credentials at once, each in its own
+     ACTIVE_DEVICE-selected block (see secrets.h.example's own comments) -
+     switch which unit you're building for by changing ACTIVE_DEVICE and
+     reflashing, no separate secrets.h per device needed any more.
+  2) Select "Heltec WiFi LoRa 32(V3)" or "...(V4)" board to match your
+     actual hardware - any USB Mode/CDC On Boot setting works since we no
+     longer depend on Heltec's own USB stack quirks for this
   3) Upload and open Serial Monitor @115200
 */
 
@@ -43,6 +59,25 @@ struct ButtonEvent {
   bool shortPress;
   bool longPress;
 };
+
+// Which physical board this binary was built for - see this file's header
+// comment for where ARDUINO_HELTEC_WIFI_LORA_32_V3/_V4 actually comes from.
+// Only used for the boot-screen label (oledShowBootLogo()); nothing else in
+// this sketch behaves differently between the two revisions.
+#if defined(ARDUINO_HELTEC_WIFI_LORA_32_V4)
+  #define BOARD_VARIANT_LABEL "Heltec V4 EU868"
+#elif defined(ARDUINO_HELTEC_WIFI_LORA_32_V3)
+  #define BOARD_VARIANT_LABEL "Heltec V3 EU868"
+#else
+  #define BOARD_VARIANT_LABEL "Heltec ?? EU868"
+#endif
+
+// This unit's own identity, from secrets.h's ACTIVE_DEVICE-selected block
+// (see secrets.h.example) - used for the mDNS/OTA hostname and the web UI's
+// title, so two units on the same network never collide the way a shared
+// board-derived name ("ttn-heltec-v3" for every V3 unit) would. Computed
+// once here rather than inline at every call site.
+const String deviceHostname = "ttn-heltec-" + String(SECRET_DEVICE_NAME);
 
 // -------------------- LoRaWAN Region --------------------
 const LoRaWANBand_t Region = EU868;
@@ -87,6 +122,13 @@ uint32_t joinRetryInterval = 30000;
 WebServer server(80);
 bool wifiEnabled = false;
 bool apMode = false;
+// The actual fallback-AP SSID in use, set once in wifiSetup() -
+// SECRET_AP_SSID with this unit's own name appended (see deviceHostname's
+// own comment) so two units falling back to AP mode on the same site at
+// once don't show up as identical, indistinguishable networks. Everything
+// that displays "what AP are we running" reads this instead of
+// SECRET_AP_SSID directly.
+String apSsid;
 String sessionToken = "";           // empty = nobody logged in
 volatile bool manualSendRequested = false;
 bool joined = false;
@@ -703,7 +745,7 @@ void oledShowBootLogo()
 
   display.setFont(ArialMT_Plain_10);
   display.drawString(64, 44, "TTN Node PD2EMC");
-  display.drawString(64, 54, "Heltec V4 EU868");
+  display.drawString(64, 54, BOARD_VARIANT_LABEL);
   display.display();
   delay(1800);
 }
@@ -749,9 +791,9 @@ static void bootLog(const String &line)
 // Small vector status icons, fixed at the top-left of every screen (main +
 // menus) - deliberately on the left, not the right (the fixed-position edge
 // meshpoint's pager_client.ino uses for its own topbar icons, see that
-// file's drawTopBar()/drawWifiIcon()): the stock Heltec case crops the
-// right edge of the OLED noticeably, so anything anchored there is partly
-// hidden behind the bezel on real hardware.
+// file's drawTopBar()/drawWifiIcon()): this board's original Heltec V3
+// casing crops the right edge of the OLED noticeably, so anything anchored
+// there is partly hidden behind the bezel on real hardware.
 // Built from OLEDDisplay's drawCircleQuads() rather than a bitmap asset -
 // quadrant bitmask confirmed against the installed library's own
 // drawCircleQuads() source (0x1=upper-right, 0x2=upper-left, 0x4=lower-left,
@@ -974,7 +1016,7 @@ static void showStatusScreen()
 static void showWifiInfoScreen()
 {
   String lines[] = {
-    apMode ? ("AP: " + String(SECRET_AP_SSID)) : ("SSID: " + WiFi.SSID()),
+    apMode ? ("AP: " + apSsid) : ("SSID: " + WiFi.SSID()),
     "IP: " + String(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()),
     apMode ? "" : ("RSSI: " + String(WiFi.RSSI()) + "dBm")
   };
@@ -1272,11 +1314,11 @@ static String formatUptime(uint32_t seconds)
 
 static void handleLoginPage()
 {
-  String html = htmlHead("ttn-heltecv4 - Login");
+  String html = htmlHead(deviceHostname + " - Login");
   html += "<div class='topbar'><div style='flex:1'></div>" + themeSwitcher() + "</div>";
   html += "<div class='login-card card'>";
   html += "<img src='/logo.jpg'>";
-  html += "<h2 class='center' style='margin-top:0'>ttn-heltecv4</h2>";
+  html += "<h2 class='center' style='margin-top:0'>" + deviceHostname + "</h2>";
   html += "<form method='POST' action='/login'>"
           "<input type='password' name='password' placeholder='Password' autofocus>"
           "<button class='btn' type='submit'>Login</button></form>";
@@ -1332,8 +1374,8 @@ static void handleRoot()
     return;
   }
 
-  String html = htmlHead("ttn-heltecv4", true);
-  html += "<div class='topbar'><img src='/logo.jpg'><h1>ttn-heltecv4</h1>" + themeSwitcher() + "</div>";
+  String html = htmlHead(deviceHostname, true);
+  html += "<div class='topbar'><img src='/logo.jpg'><h1>" + deviceHostname + "</h1>" + themeSwitcher() + "</div>";
   html += "<div class='cards'>";
 
   // ---- ESP32 card ----
@@ -1349,11 +1391,11 @@ static void handleRoot()
   // ---- WiFi card ----
   html += "<div class='card'><h2>WiFi</h2>";
   html += cardRow("Mode", apMode ? "AP (fallback)" : "STA");
-  html += cardRow("SSID", apMode ? String(SECRET_AP_SSID) : WiFi.SSID());
+  html += cardRow("SSID", apMode ? apSsid : WiFi.SSID());
   html += cardRow("IP", apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
   if (!apMode) html += cardRow("RSSI", String(WiFi.RSSI()) + " dBm");
   html += cardRow("MAC", WiFi.macAddress());
-  html += cardRow("Hostname", "ttn-heltecv4.local");
+  html += cardRow("Hostname", deviceHostname + ".local");
   html += "</div>";
 
   // ---- LoRaWAN card ----
@@ -1413,13 +1455,14 @@ static void wifiSetup()
     apMode = true;
     bootLog("WiFi failed, AP fallback");
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(SECRET_AP_SSID, SECRET_AP_PASSWORD);
-    bootLog("AP: " + String(SECRET_AP_SSID));
+    apSsid = String(SECRET_AP_SSID) + "-" + String(SECRET_DEVICE_NAME);
+    WiFi.softAP(apSsid.c_str(), SECRET_AP_PASSWORD);
+    bootLog("AP: " + apSsid);
     bootLog("AP IP " + WiFi.softAPIP().toString());
   }
   delay(1500);
 
-  if (MDNS.begin("ttn-heltecv4")) {
+  if (MDNS.begin(deviceHostname.c_str())) {
     bootLog("mDNS ready");
     MDNS.addService("http", "tcp", 80);
   }
@@ -1441,7 +1484,7 @@ static void wifiSetup()
   // ArduinoOTA: lets the Arduino IDE (or arduino-cli) flash over WiFi like a
   // normal USB upload - the device just shows up as a network port instead
   // of a serial one, discovered via the same mDNS hostname.
-  ArduinoOTA.setHostname("ttn-heltecv4");
+  ArduinoOTA.setHostname(deviceHostname.c_str());
   ArduinoOTA.setPassword(SECRET_WEB_PASSWORD);
   ArduinoOTA.onStart([]() {
     Serial.println("ArduinoOTA: update starting");
@@ -1540,11 +1583,13 @@ void setup()
   hexKeyToBytes(SECRET_NWK_KEY, nwkKey, sizeof(nwkKey));
 
   // heltec_display_power() (called from heltec_setup() below) only enables
-  // Vext for the "Wireless Stick" board variant - it assumes the regular
-  // V3 board doesn't gate the OLED through Vext. Our V4 board does (same
-  // as the official Heltec library needed), so we have to power it
-  // ourselves before display.init() runs inside heltec_setup(), or the
-  // screen stays dark even though I2C calls silently "succeed".
+  // Vext for the "Wireless Stick" board variant - it assumes plain V3
+  // boards don't gate the OLED through Vext. This sketch was carried over
+  // from a V4 unit where that assumption was wrong (OLED stayed dark, even
+  // though I2C calls silently "succeeded"), so it powers Vext itself before
+  // display.init() runs inside heltec_setup(). Kept here as a harmless
+  // no-op if this V3 unit doesn't need it - if the OLED comes up fine,
+  // there was nothing to fix; if it doesn't, this line is why.
   heltec_ve(true);
   delay(50);
 
@@ -1571,7 +1616,7 @@ void setup()
   bootLog("Init radio...");
 
   Serial.println("\n===================================");
-  Serial.println("Heltec V4 TTN EU868 OTAA + OLED");
+  Serial.println("Heltec V3 TTN EU868 OTAA + OLED");
   Serial.println("===================================");
   Serial.printf("DevEUI:  %016llX\n", devEUI);
   Serial.printf("JoinEUI: %016llX\n", joinEUI);
