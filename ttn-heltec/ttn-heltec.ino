@@ -833,7 +833,8 @@ static void drawTopbar()
   display.drawLine(0, 11, 127, 11);
 }
 
-void oledStatus(const String &line1, const String &line2 = "", const String &line3 = "")
+void oledStatus(const String &line1, const String &line2 = "", const String &line3 = "",
+                 const String &footer = "")
 {
   display.displayOn();   // wake it back up in case a previous screen blanked it
   display.clear();
@@ -844,8 +845,10 @@ void oledStatus(const String &line1, const String &line2 = "", const String &lin
   if (line2.length()) display.drawString(0, 25, line2);
   if (line3.length()) display.drawString(0, 37, line3);
 
-  // footer
-  display.drawString(0, 52, "Uplinks: " + String(uplinkCount));
+  // footer - defaults to the uplink counter, but a caller can override it
+  // with something more useful for their own screen (see the idle screen's
+  // link-quality footer in waitWithCountdown()'s combineLine23 path).
+  display.drawString(0, 52, footer.length() ? footer : "Messages Sent: " + String(uplinkCount));
   display.display();
 }
 
@@ -1093,7 +1096,8 @@ static void runTopMenu()
 // PRG button: any press wakes the screen for a fresh 10s even if it was
 // blanked; holding it (~1s) opens the menu above.
 static void waitWithCountdown(uint32_t totalMs, const String &line1, const String &line2,
-                               const String &line3Prefix, uint32_t blankAfterMs = 10000)
+                               const String &line3Prefix, uint32_t blankAfterMs = 10000,
+                               bool combineLine23 = false)
 {
   uint32_t waitStart = millis();
   bool blanked = false;
@@ -1126,7 +1130,25 @@ static void waitWithCountdown(uint32_t totalMs, const String &line1, const Strin
     if (elapsed < blankAfterMs || millis() < buttonWakeUntil) {
       uint32_t remainingSecond = (totalMs - elapsed) / 1000;
       if (remainingSecond != lastDrawnSecond) {
-        oledStatus(line1, line2, line3Prefix + String(remainingSecond) + "s");
+        String countdown = line3Prefix + String(remainingSecond) + "s";
+        // combineLine23 puts the label and its live countdown on the same
+        // row ("Next tx in: 119s") instead of two separate ones - only
+        // safe for short label+countdown pairs that actually fit one
+        // 128px-wide line; the JOIN-retry caller's longer message stays on
+        // its own row via the default (false) behavior. Only this (idle
+        // screen) path also repurposes the footer: the freed-up row that
+        // combining line2/3 leaves behind gets "Messages Sent" moved into
+        // it, and the actual footer becomes the last downlink's RSSI/SNR -
+        // more useful to see refresh every idle cycle than a static
+        // message counter, since it's the at-a-glance answer to "is this
+        // node still reaching the gateway well".
+        if (combineLine23) {
+          oledStatus(line1, line2 + " " + countdown,
+                     "Messages Sent: " + String(uplinkCount),
+                     "RSSI:" + String(lastRSSI, 0) + " SNR:" + String(lastSNR, 1));
+        } else {
+          oledStatus(line1, line2, countdown);
+        }
         lastDrawnSecond = remainingSecond;
       }
       blanked = false;
@@ -1404,7 +1426,7 @@ static void handleRoot()
   html += cardRow("DevEUI", hex64(devEUI));
   if (joined) html += cardRow("DevAddr", String((unsigned long)node.getDevAddr(), HEX));
   html += cardRow("Region / Class", "EU868 / A");
-  html += cardRow("Uplinks sent", String(uplinkCount));
+  html += cardRow("Messages sent", String(uplinkCount));
   html += cardRow("Last downlink RSSI", String(lastRSSI, 1) + " dBm");
   html += cardRow("Last downlink SNR", String(lastSNR, 1) + " dB");
   html += "</div>";
@@ -1700,6 +1722,18 @@ void loop()
 
   Serial.println("STATE: SEND");
 
+  // Wake the screen here, before the actual radio work below, not after.
+  // node.sendReceive() further down is a blocking call - it transmits AND
+  // then waits through LoRaWAN's mandatory RX1/RX2 receive windows (RX1
+  // opens ~1s after TX ends, RX2 ~2s after, each window's own duration
+  // depending on the data rate in use) - that whole sequence can run
+  // several seconds, and the screen used to stay dark that entire time
+  // since oledStatus() (which wakes it) wasn't called until after
+  // sendReceive() returned. Waking it here instead means it's already lit
+  // through the TX/RX wait, so the cycle is visible starting the moment it
+  // begins instead of the screen looking dead for several seconds first.
+  oledStatus("STATE: MAKE MESSAGE", "Reading temp...");
+
   uint8_t payload[2];
   uint8_t payloadLen;
   prepareTxFrame(payload, payloadLen);
@@ -1708,6 +1742,12 @@ void loop()
   Serial.printf("Payload (%d bytes): ", payloadLen);
   printHex(payload, payloadLen);
   Serial.println();
+
+  // Show the reading as soon as it's actually known, rather than only after
+  // the send finishes - sendReceive() below is the several-second TX/RX1/RX2
+  // wait (see the comment above), so without this the temperature sat
+  // computed-but-invisible on screen for that whole stretch.
+  oledStatus("STATE: SENDING", "Temp: " + String(lastTempC, 1) + " C", "Sending...");
 
   uint8_t downlink[256];
   size_t downlinkLen = sizeof(downlink);
@@ -1735,11 +1775,11 @@ void loop()
 
   uplinkCount++;
   lastSendMillis = millis();
-  oledStatus("STATE: SEND", "Uplink #" + String(uplinkCount),
+  oledStatus("STATE: SEND", "Messages sent #" + String(uplinkCount),
              "Temp: " + String(lastTempC, 1) + " C");
-  Serial.printf("Uplink #%lu done\n", (unsigned long)uplinkCount);
+  Serial.printf("Message #%lu done\n", (unsigned long)uplinkCount);
 
   uint32_t waitMs = appTxDutyCycle + random(-3000, 3000);
-  Serial.printf("STATE: CYCLE, next in %lu ms\n", (unsigned long)waitMs);
-  waitWithCountdown(waitMs, "STATE: CYCLE", "Next tx in:", "");
+  Serial.printf("STATE: IDLE, next in %lu ms\n", (unsigned long)waitMs);
+  waitWithCountdown(waitMs, "STATE: IDLE", "Next tx in:", "", 10000, true);
 }
