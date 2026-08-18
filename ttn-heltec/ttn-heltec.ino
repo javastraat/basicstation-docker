@@ -1145,7 +1145,7 @@ static void waitWithCountdown(uint32_t totalMs, const String &line1, const Strin
         if (combineLine23) {
           oledStatus(line1, line2 + " " + countdown,
                      "Messages Sent: " + String(uplinkCount),
-                     "RSSI:" + String(lastRSSI, 0) + " SNR:" + String(lastSNR, 1));
+                     "Last RSSI:" + String(lastRSSI, 0) + " SNR:" + String(lastSNR, 1));
         } else {
           oledStatus(line1, line2, countdown);
         }
