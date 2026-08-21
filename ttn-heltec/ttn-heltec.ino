@@ -1388,6 +1388,30 @@ static void handleSend()
   server.send(302);
 }
 
+// Same action as the on-device menu's "Clear LoRa state" (runSettingsMenu(),
+// choice==2) -- wipes the saved DevNonce/session from NVS and reboots, so
+// the next boot does a full fresh OTAA join instead of resuming. Duplicated
+// here rather than calling into the menu code since that path is written
+// around blocking button-poll loops, not a web request/response.
+static void handleClearLoraState()
+{
+  if (!isAuthed()) {
+    server.sendHeader("Location", "/login");
+    server.send(302);
+    return;
+  }
+  Serial.println("Clearing saved LoRaWAN state from web");
+  lorawanPrefs.begin("lorawan", false);
+  lorawanPrefs.remove("nonces");
+  lorawanPrefs.remove("session");
+  lorawanPrefs.end();
+  oledStatus("Cleared!", "Rebooting...");
+  server.sendHeader("Location", "/");
+  server.send(302);
+  delay(1500);
+  ESP.restart();
+}
+
 static void handleRoot()
 {
   if (!isAuthed()) {
@@ -1429,6 +1453,9 @@ static void handleRoot()
   html += cardRow("Messages sent", String(uplinkCount));
   html += cardRow("Last downlink RSSI", String(lastRSSI, 1) + " dBm");
   html += cardRow("Last downlink SNR", String(lastSNR, 1) + " dB");
+  html += "<form method='POST' action='/clear-lora' class='center' style='margin-top:14px' "
+          "onsubmit=\"return confirm('Clear saved LoRa session and reboot? The device will rejoin from scratch.')\">"
+          "<button class='btn' type='submit'>Clear LoRa state</button></form>";
   html += "</div>";
 
   // ---- Send status card ----
@@ -1494,6 +1521,7 @@ static void wifiSetup()
   server.on("/login", HTTP_POST, handleLoginPost);
   server.on("/logout", HTTP_GET, handleLogout);
   server.on("/send", HTTP_POST, handleSend);
+  server.on("/clear-lora", HTTP_POST, handleClearLoraState);
   server.on("/logo.jpg", HTTP_GET, handleLogoImage);
 
   const char *headerKeys[] = { "Cookie" };
